@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# BioVault specific
+*.bvault
+__pycache__/
+*.pyc
+.vscode/
+*.egg-info/
+build/
+dist/
