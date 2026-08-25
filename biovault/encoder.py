@@ -1,5 +1,5 @@
 # biovault/encoder.py
-# V2.0 — Full pipeline: compress -> encrypt(optional) -> base4 -> pack
+# V3 — Full pipeline: compress -> encrypt(optional) -> base4 -> pack
 
 import os
 import json
@@ -9,31 +9,38 @@ from .frames import bytes_to_base4, get_antisense, READING_MODES
 from .crypto import encrypt_data
 from .compression import compress_data
 from .packer import pack_sequence
+from .output import safe_print
 
 MAGIC = b'BVLT'
-VERSION = 2
+VERSION = 3
 FOOTER_MAGIC = b'TLVB'
+
+# Full SHA-256, not truncated. The old 64-bit prefix was birthday-weak, and
+# this checksum is unkeyed anyway, so there is no reason to spend collision
+# resistance to save 48 bytes.
+CHECKSUM_HEX_LEN = 64
 
 
 def compute_checksum(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()[:16]
+    return hashlib.sha256(data).hexdigest()
 
 
 def encode_layer(data: bytes, mode: str, password: str = None):
     """
-    Full v2 pipeline for one layer.
+    Full pipeline for one layer.
     data -> compress -> encrypt(if password) -> base4 -> frame offset -> pack
 
-    Returns: (packed_bytes, sequence_length, payload_length, encrypted, salt)
+    Returns: (packed_bytes, sequence_length, payload_length, encrypted, salt, kdf)
     """
     compressed = compress_data(data)
 
     salt = None
+    kdf = None
     encrypted = False
     payload = compressed
 
     if password:
-        payload, salt = encrypt_data(compressed, password)
+        payload, salt, kdf = encrypt_data(compressed, password)
         encrypted = True
 
     payload_length = len(payload)  # exact byte length — needed to trim padding later
@@ -48,7 +55,7 @@ def encode_layer(data: bytes, mode: str, password: str = None):
         sequence = ('A' * frame_num) + get_antisense(base4)
 
     packed = pack_sequence(sequence)
-    return packed, len(sequence), payload_length, encrypted, salt
+    return packed, len(sequence), payload_length, encrypted, salt, kdf
 
 
 class BioVaultEncoder:
@@ -65,7 +72,7 @@ class BioVaultEncoder:
 
         self.layers.append((mode, filename, data, password))
         tag = "🔐 encrypted" if password else "plain"
-        print(f"  Layer {mode} queued: {filename} ({len(data):,} bytes) [{tag}]")
+        safe_print(f"  Layer {mode} queued: {filename} ({len(data):,} bytes) [{tag}]")
 
     def save(self, output_path: str):
         if not self.layers:
@@ -73,27 +80,40 @@ class BioVaultEncoder:
         if not output_path.endswith('.bvault'):
             output_path += '.bvault'
 
-        print(f"\n🧬 Building BioVault v{VERSION}: {output_path}")
+        safe_print(f"\n🧬 Building BioVault v{VERSION}: {output_path}")
 
         metadata = {'version': VERSION, 'layer_count': len(self.layers), 'layers': []}
         packed_blobs = []
 
         for mode, filename, data, password in self.layers:
-            print(f"  🔄 Encoding layer {mode}...")
-            packed, seq_len, payload_len, encrypted, salt = encode_layer(data, mode, password)
-            checksum = compute_checksum(data)
+            safe_print(f"  🔄 Encoding layer {mode}...")
+            packed, seq_len, payload_len, encrypted, salt, kdf = encode_layer(data, mode, password)
 
-            metadata['layers'].append({
+            layer_meta = {
                 'mode': mode,
-                'filename': filename,
-                'original_size': len(data),
                 'sequence_length': seq_len,     # ATGC symbol count (for unpacking)
                 'payload_length': payload_len,  # exact compressed(+encrypted) byte length
                 'packed_length': len(packed),   # bytes this layer occupies in the blob
-                'checksum': checksum,
                 'encrypted': encrypted,
-                'salt': salt.hex() if salt else None
-            })
+                'salt': salt.hex() if salt else None,
+                'kdf': kdf,
+            }
+
+            if encrypted:
+                # Deliberately absent for encrypted layers: metadata is
+                # readable without the password, so a plaintext hash would let
+                # anyone confirm a guessed plaintext, and the exact plaintext
+                # size is itself a leak. Fernet's HMAC already authenticates
+                # the layer when it is decrypted.
+                layer_meta['checksum'] = None
+                layer_meta['original_size'] = None
+            else:
+                layer_meta['checksum'] = compute_checksum(data)
+                layer_meta['original_size'] = len(data)
+
+            # No 'filename' field: the decoder must never take an output path
+            # from the file it is reading.
+            metadata['layers'].append(layer_meta)
             packed_blobs.append(packed)
 
         layers_blob = b''.join(packed_blobs)
@@ -114,8 +134,8 @@ class BioVaultEncoder:
         file_size = os.path.getsize(output_path)
         ratio = file_size / original_total if original_total else 0
 
-        print(f"\n✅ BioVault created: {output_path}")
-        print(f"   Layers: {len(self.layers)}")
-        print(f"   Original total: {original_total:,} bytes")
-        print(f"   Vault size:     {file_size:,} bytes  ({ratio:.2f}x original)")
-        print(f"   Keys: {[l[0] for l in self.layers]}")
+        safe_print(f"\n✅ BioVault created: {output_path}")
+        safe_print(f"   Layers: {len(self.layers)}")
+        safe_print(f"   Original total: {original_total:,} bytes")
+        safe_print(f"   Vault size:     {file_size:,} bytes  ({ratio:.2f}x original)")
+        safe_print(f"   Keys: {[l[0] for l in self.layers]}")

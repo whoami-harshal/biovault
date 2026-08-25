@@ -22,8 +22,12 @@ def bytes_to_base4(data: bytes) -> str:
 def base4_to_bytes(sequence: str) -> bytes:
     """Convert ATGC sequence back to raw bytes"""
     result = []
-    # Clean sequence — only valid symbols
-    sequence = ''.join(c for c in sequence if c in SYMBOLS)
+    # Reject anything that is not a base-4 symbol. Silently dropping stray
+    # characters here turned malformed input into plausible-looking but wrong
+    # output, which is worse than failing.
+    invalid = set(sequence) - set(SYMBOLS)
+    if invalid:
+        raise ValueError(f"Sequence contains non-ATGC symbols: {sorted(invalid)}")
     # Pad to multiple of 4
     while len(sequence) % 4 != 0:
         sequence += 'A'

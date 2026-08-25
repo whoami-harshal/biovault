@@ -14,7 +14,7 @@ from .crypto import encrypt_data, decrypt_data
 from .compression import compress_data, decompress_data
 from .packer import pack_sequence, unpack_sequence
 
-__version__ = '2.0.0'
+__version__ = '3.0.0'
 __author__ = 'Harshal'
 __description__ = 'DNA-inspired multi-layer file format'
 
