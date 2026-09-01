@@ -1,18 +1,19 @@
 # biovault/encoder.py
-# V3 — Full pipeline: compress -> encrypt(optional) -> base4 -> pack
+# V4 — Full pipeline: compress -> encrypt(optional) -> base4 -> pack
 
 import os
 import json
 import struct
 import hashlib
-from .frames import bytes_to_base4, get_antisense, READING_MODES
+from .frames import READING_MODES
+from .transform import payload_to_packed
 from .crypto import encrypt_data
 from .compression import compress_data
-from .packer import pack_sequence
+from .signing import sign, SIGNATURE_LEN, PUBLIC_KEY_LEN, fingerprint
 from .output import safe_print
 
 MAGIC = b'BVLT'
-VERSION = 3
+VERSION = 4
 FOOTER_MAGIC = b'TLVB'
 
 # Full SHA-256, not truncated. The old 64-bit prefix was birthday-weak, and
@@ -45,17 +46,8 @@ def encode_layer(data: bytes, mode: str, password: str = None):
 
     payload_length = len(payload)  # exact byte length — needed to trim padding later
 
-    base4 = bytes_to_base4(payload)
-    mode_type = mode[0]
-    frame_num = int(mode[1])
-
-    if mode_type == 'A':
-        sequence = ('A' * frame_num) + base4
-    else:
-        sequence = ('A' * frame_num) + get_antisense(base4)
-
-    packed = pack_sequence(sequence)
-    return packed, len(sequence), payload_length, encrypted, salt, kdf
+    packed, sequence_length = payload_to_packed(payload, mode)
+    return packed, sequence_length, payload_length, encrypted, salt, kdf
 
 
 class BioVaultEncoder:
@@ -74,7 +66,7 @@ class BioVaultEncoder:
         tag = "🔐 encrypted" if password else "plain"
         safe_print(f"  Layer {mode} queued: {filename} ({len(data):,} bytes) [{tag}]")
 
-    def save(self, output_path: str):
+    def save(self, output_path: str, sign_key=None):
         if not self.layers:
             raise ValueError("No layers added. Use add_layer() first.")
         if not output_path.endswith('.bvault'):
@@ -121,13 +113,18 @@ class BioVaultEncoder:
         meta_length = struct.pack('>I', len(meta_bytes))
         final_checksum = compute_checksum(meta_bytes + layers_blob).encode()
 
+        # Everything the signature covers, assembled first.
+        body = MAGIC + bytes([VERSION]) + meta_length + meta_bytes + layers_blob + final_checksum
+
+        if sign_key is not None:
+            signature, raw_pub = sign(sign_key, body)
+            trailer = bytes([1]) + raw_pub + signature
+        else:
+            trailer = bytes([0])
+
         with open(output_path, 'wb') as f:
-            f.write(MAGIC)
-            f.write(bytes([VERSION]))
-            f.write(meta_length)
-            f.write(meta_bytes)
-            f.write(layers_blob)
-            f.write(final_checksum)
+            f.write(body)
+            f.write(trailer)
             f.write(FOOTER_MAGIC)
 
         original_total = sum(len(d) for _, _, d, _ in self.layers)
@@ -139,3 +136,5 @@ class BioVaultEncoder:
         safe_print(f"   Original total: {original_total:,} bytes")
         safe_print(f"   Vault size:     {file_size:,} bytes  ({ratio:.2f}x original)")
         safe_print(f"   Keys: {[l[0] for l in self.layers]}")
+        if sign_key is not None:
+            safe_print(f"   Signed by: {fingerprint(sign_key.public_key().public_bytes_raw())}")

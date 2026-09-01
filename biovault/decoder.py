@@ -1,5 +1,5 @@
 # biovault/decoder.py
-# V3 — Full pipeline: unpack -> remove frame offset -> base4_to_bytes ->
+# V4 — Full pipeline: unpack -> remove frame offset -> base4_to_bytes ->
 #       trim to payload_length -> decrypt(if needed) -> decompress
 #
 # Everything in a vault's metadata is attacker-controlled: the trailing
@@ -10,16 +10,17 @@
 import json
 import struct
 import hashlib
-from .frames import base4_to_bytes, get_antisense, READING_MODES
+from .frames import READING_MODES
+from .transform import packed_to_payload
 from .crypto import decrypt_data, DEFAULT_KDF
 from .compression import decompress_data, DEFAULT_MAX_DECOMPRESSED
-from .packer import unpack_sequence
+from .signing import verify, fingerprint, SIGNATURE_LEN, PUBLIC_KEY_LEN
 from .output import safe_print
 
 MAGIC = b'BVLT'
 FOOTER_MAGIC = b'TLVB'
 CHECKSUM_HEX_LEN = 64
-SUPPORTED_VERSION = 3
+SUPPORTED_VERSION = 4
 
 
 def compute_checksum(data: bytes) -> str:
@@ -47,6 +48,10 @@ class BioVaultDecoder:
         self.max_decompressed = max_decompressed
         self.metadata = None
         self.layers_blob = None
+        self.signed = False
+        self.signature = None
+        self.public_key = None
+        self._signed_body = None
         self._load()
 
     def _load(self):
@@ -83,6 +88,15 @@ class BioVaultDecoder:
             stored = _read_exact(f, CHECKSUM_HEX_LEN, 'checksum')
             stored_checksum = stored.decode('ascii', 'replace')
 
+            # Signature trailer: 1 flag byte, then key + signature when present.
+            sig_flag = _read_exact(f, 1, 'signature flag')[0]
+            if sig_flag == 1:
+                self.public_key = _read_exact(f, PUBLIC_KEY_LEN, 'public key')
+                self.signature = _read_exact(f, SIGNATURE_LEN, 'signature')
+                self.signed = True
+            elif sig_flag != 0:
+                raise ValueError("BioVault file corrupted — bad signature flag")
+
             footer = _read_exact(f, 4, 'footer')
             if footer != FOOTER_MAGIC:
                 raise ValueError("BioVault file corrupted — invalid footer")
@@ -91,9 +105,22 @@ class BioVaultDecoder:
             if computed != stored_checksum:
                 raise ValueError("BioVault file corrupted — checksum mismatch")
 
+            self._signed_body = (
+                MAGIC + bytes([version]) + struct.pack('>I', meta_length)
+                + meta_bytes + self.layers_blob + stored
+            )
+
+        if self.signed and not verify(self.public_key, self.signature, self._signed_body):
+            raise ValueError(
+                "BioVault signature is invalid — the file has been modified "
+                "since it was signed"
+            )
+
         safe_print(f"✅ BioVault loaded: {self.vault_path}")
         safe_print(f"   Version: {self.metadata['version']}")
         safe_print(f"   Layers: {self.metadata['layer_count']}")
+        if self.signed:
+            safe_print(f"   Signed by: {fingerprint(self.public_key)} (identity not yet checked)")
 
     def _validate_metadata(self):
         """Reject malformed metadata up front so later code can trust its shape."""
@@ -148,7 +175,35 @@ class BioVaultDecoder:
         encrypted_keys = [l['mode'] for l in self.metadata['layers'] if l['encrypted']]
         safe_print(f"   Available keys: {keys}")
         safe_print(f"   Encrypted layers: {encrypted_keys if encrypted_keys else 'none'}")
+        if self.signed:
+            safe_print(f"   Signature: present, key {fingerprint(self.public_key)}")
+            safe_print(f"              (run 'verify --key <file>' to confirm who signed it)")
+        else:
+            safe_print(f"   Signature: none — authenticity cannot be verified")
         safe_print()
+
+    def require_signature(self, expected_public_key: bytes) -> bool:
+        """
+        Confirm this vault was signed by the holder of expected_public_key.
+
+        Loading already rejects a signature that does not match the file's own
+        embedded key, but that only proves internal consistency — an attacker
+        can re-sign a modified vault with their own key. Checking against a key
+        the caller supplies out of band is what actually proves authorship.
+        """
+        if not self.signed:
+            raise ValueError(
+                "This vault is not signed — its authenticity cannot be verified"
+            )
+        if self.public_key != expected_public_key:
+            raise ValueError(
+                "Vault was signed by a different key than expected.\n"
+                f"    expected: {fingerprint(expected_public_key)}\n"
+                f"    found:    {fingerprint(self.public_key)}"
+            )
+        if not verify(self.public_key, self.signature, self._signed_body):
+            raise ValueError("Signature is invalid — the file has been modified")
+        return True
 
     def layer_meta(self, mode: str):
         """Metadata for one reading mode, or None if the vault has no such layer."""
@@ -177,18 +232,14 @@ class BioVaultDecoder:
 
         # ── Pull this layer's packed bytes out of the blob ──
         packed = self.layers_blob[offset: offset + layer_meta['packed_length']]
-        sequence = unpack_sequence(packed, layer_meta['sequence_length'])
 
-        # ── Remove frame offset ──
-        mode_type = mode[0]
-        frame_num = int(mode[1])
-        if mode_type == 'A':
-            clean_sequence = sequence[frame_num:]
-        else:
-            clean_sequence = get_antisense(sequence[frame_num:])
-
-        # ── Back to bytes, trimmed to exact payload length ──
-        payload = base4_to_bytes(clean_sequence)[:layer_meta['payload_length']]
+        # ── Undo frame offset, strand, and packing in one pass ──
+        payload = packed_to_payload(
+            packed,
+            layer_meta['sequence_length'],
+            mode,
+            layer_meta['payload_length'],
+        )
 
         # ── Decrypt if this layer was encrypted ──
         if layer_meta.get('encrypted'):

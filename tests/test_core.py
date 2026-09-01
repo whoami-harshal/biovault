@@ -14,7 +14,10 @@ import zstandard as zstd
 from biovault.frames import bytes_to_base4, base4_to_bytes, get_antisense
 from biovault.encoder import BioVaultEncoder
 from biovault.decoder import BioVaultDecoder
-from biovault.packer import pack_sequence
+from biovault.packer import pack_sequence, unpack_sequence
+from biovault.signing import generate_keypair, load_private_key, sign as ed_sign
+from biovault.frames import READING_MODES, get_antisense
+from biovault.transform import payload_to_packed, packed_to_payload
 
 MAGIC = b'BVLT'
 FOOTER = b'TLVB'
@@ -47,7 +50,7 @@ def _read_vault(path):
     return meta, blob
 
 
-def _write_vault(path, meta, blob, version=3):
+def _write_vault(path, meta, blob, version=4):
     """Rebuild a vault the way an attacker would — recomputing the checksum."""
     meta_bytes = json.dumps(meta).encode()
     with open(path, 'wb') as f:
@@ -57,6 +60,7 @@ def _write_vault(path, meta, blob, version=3):
         f.write(meta_bytes)
         f.write(blob)
         f.write(_sha(meta_bytes + blob).encode())
+        f.write(bytes([0]))          # no signature
         f.write(FOOTER)
 
 
@@ -215,7 +219,7 @@ def test_decompression_bomb_is_capped():
         bomb = cctx.compress(b'\x00' * (50 * 1024 * 1024))
         seq = bytes_to_base4(bomb)
         packed = pack_sequence(seq)
-        meta = {'version': 3, 'layer_count': 1, 'layers': [{
+        meta = {'version': 4, 'layer_count': 1, 'layers': [{
             'mode': 'A0', 'sequence_length': len(seq), 'payload_length': len(bomb),
             'packed_length': len(packed), 'encrypted': False, 'salt': None,
             'kdf': None, 'checksum': None, 'original_size': None,
@@ -272,6 +276,143 @@ def test_malformed_vaults_raise_valueerror():
     _cleanup('good.bvault', 'bad.bvault')
 
 
+
+def test_packer_is_one_to_one():
+    """4 symbols per byte: packed output must match the original byte count."""
+    for n in (16, 1000, 50000):
+        data = os.urandom(n)
+        packed = pack_sequence(bytes_to_base4(data))
+        assert len(packed) == n, f"{n} bytes packed to {len(packed)} (expected 1:1)"
+
+    # every remainder class must survive the round trip
+    import random
+    for n in range(1, 40):
+        seq = ''.join(random.choice('ATGC') for _ in range(n))
+        assert unpack_sequence(pack_sequence(seq), len(seq)) == seq, f"len {n} failed"
+
+    print("✅ test_packer_is_one_to_one passed")
+
+
+
+def test_fast_path_matches_reference():
+    """
+    transform.py must produce byte-identical output to the readable
+    frames.py + packer.py implementation, for every mode and length class.
+    """
+    def reference_encode(payload, mode):
+        base4 = bytes_to_base4(payload)
+        body = base4 if mode[0] == 'A' else get_antisense(base4)
+        seq = ('A' * int(mode[1])) + body
+        return pack_sequence(seq), len(seq)
+
+    checked = 0
+    for mode in READING_MODES:
+        for n in list(range(0, 24)) + [255, 256, 1000, 4097]:
+            payload = os.urandom(n)
+
+            ref = reference_encode(payload, mode)
+            fast = payload_to_packed(payload, mode)
+            assert ref == fast, f"encode mismatch: mode={mode} n={n}"
+
+            back = packed_to_payload(fast[0], fast[1], mode, n)
+            assert back == payload, f"decode mismatch: mode={mode} n={n}"
+            checked += 1
+
+    assert checked == len(READING_MODES) * 28
+    print(f"✅ test_fast_path_matches_reference passed ({checked} combinations)")
+
+
+def _make_signed_vault(path, key_path):
+    private_pem, public_pem = generate_keypair()
+    open(key_path, 'wb').write(private_pem)
+    open(key_path + '.pub', 'wb').write(public_pem)
+
+    key = load_private_key(key_path)
+    encoder = BioVaultEncoder()
+    _quiet(encoder.add_layer, 'A0', 'a.txt', b'signed payload')
+    _quiet(encoder.save, path, sign_key=key)
+    return key
+
+
+def test_signature_roundtrip():
+    """A signed vault verifies against the key that signed it."""
+    from biovault.signing import load_public_key
+    key = _make_signed_vault('signed.bvault', 'sk')
+
+    decoder = _quiet(BioVaultDecoder, 'signed.bvault')
+    assert decoder.signed, "vault did not record a signature"
+    assert decoder.require_signature(load_public_key('sk.pub'))
+
+    print("✅ test_signature_roundtrip passed")
+    _cleanup('signed.bvault', 'sk', 'sk.pub')
+
+
+def test_signature_detects_tampering():
+    """Editing the vault and recomputing the checksum must not pass."""
+    _make_signed_vault('signed.bvault', 'sk')
+
+    raw = bytearray(open('signed.bvault', 'rb').read())
+    meta, blob = _read_vault('signed.bvault')
+    meta_bytes = json.dumps(meta).encode()
+    start = 9 + len(meta_bytes)
+
+    tampered = bytearray(blob)
+    tampered[-2] ^= 0xFF
+    body = (MAGIC + bytes([4]) + struct.pack('>I', len(meta_bytes)) + meta_bytes
+            + bytes(tampered) + _sha(meta_bytes + bytes(tampered)).encode())
+    trailer = raw[start + len(blob) + 64:-4]        # keep the original signature
+    open('signed.bvault', 'wb').write(body + bytes(trailer) + FOOTER)
+
+    try:
+        _quiet(BioVaultDecoder, 'signed.bvault')
+        raise AssertionError("tampered signed vault loaded without error")
+    except ValueError as e:
+        assert 'signature' in str(e).lower(), f"unexpected error: {e}"
+
+    print("✅ test_signature_detects_tampering passed")
+    _cleanup('signed.bvault', 'sk', 'sk.pub')
+
+
+def test_signature_wrong_key_rejected():
+    """A vault re-signed by someone else must fail against the expected key."""
+    from biovault.signing import load_public_key
+    _make_signed_vault('signed.bvault', 'sk')
+    other_private, other_public = generate_keypair()
+    open('other.pub', 'wb').write(other_public)
+
+    decoder = _quiet(BioVaultDecoder, 'signed.bvault')
+    try:
+        decoder.require_signature(load_public_key('other.pub'))
+        raise AssertionError("wrong public key was accepted")
+    except ValueError:
+        pass
+
+    print("✅ test_signature_wrong_key_rejected passed")
+    _cleanup('signed.bvault', 'sk', 'sk.pub', 'other.pub')
+
+
+def test_unsigned_vault_cannot_be_verified():
+    """An unsigned vault must not silently pass verification."""
+    from biovault.signing import load_public_key
+    _, public_pem = generate_keypair()
+    open('lone.pub', 'wb').write(public_pem)
+
+    encoder = BioVaultEncoder()
+    _quiet(encoder.add_layer, 'A0', 'a.txt', b'unsigned')
+    _quiet(encoder.save, 'plain.bvault')
+
+    decoder = _quiet(BioVaultDecoder, 'plain.bvault')
+    assert not decoder.signed
+    try:
+        decoder.require_signature(load_public_key('lone.pub'))
+        raise AssertionError("unsigned vault passed verification")
+    except ValueError:
+        pass
+
+    print("✅ test_unsigned_vault_cannot_be_verified passed")
+    _cleanup('plain.bvault', 'lone.pub')
+
+
 if __name__ == '__main__':
     print("\n🧪 Running BioVault Tests...\n")
     test_base4_roundtrip()
@@ -279,6 +420,8 @@ if __name__ == '__main__':
     test_base4_rejects_junk()
     test_full_vault()
     test_encrypted_roundtrip()
+    test_packer_is_one_to_one()
+    test_fast_path_matches_reference()
 
     print("\n🔒 Security regressions...\n")
     test_output_path_never_from_metadata()
@@ -286,5 +429,11 @@ if __name__ == '__main__':
     test_encrypted_layer_leaks_no_plaintext_fingerprint()
     test_decompression_bomb_is_capped()
     test_malformed_vaults_raise_valueerror()
+
+    print("\n✍️  Signing...\n")
+    test_signature_roundtrip()
+    test_signature_detects_tampering()
+    test_signature_wrong_key_rejected()
+    test_unsigned_vault_cannot_be_verified()
 
     print("\n🎉 All tests passed!")

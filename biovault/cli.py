@@ -1,15 +1,37 @@
 # biovault/cli.py
-# V3 — same commands, with secure password entry and version info
+# V4 — encode/decode/info, plus keygen and signature verification
 
 import argparse
 import getpass
+import os
 import sys
 from .encoder import BioVaultEncoder
 from .decoder import BioVaultDecoder
+from .compression import DEFAULT_MAX_DECOMPRESSED
+from .signing import (
+    generate_keypair, load_private_key, load_public_key, fingerprint,
+)
 from .output import safe_print
 
 # Errors that mean "bad input file", not "bug in BioVault".
 VAULT_ERRORS = (ValueError, KeyError, IndexError, OSError)
+
+
+def _parse_size(text):
+    """Accept plain bytes or a K/M/G suffix, e.g. 512M or 2G."""
+    text = text.strip().upper()
+    units = {'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3}
+    if text and text[-1] in units:
+        number, factor = text[:-1], units[text[-1]]
+    else:
+        number, factor = text, 1
+    try:
+        value = int(float(number) * factor)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a size: {text}")
+    if value <= 0:
+        raise argparse.ArgumentTypeError("size must be positive")
+    return value
 
 
 def _read_stdin_password():
@@ -48,6 +70,71 @@ def _warn_password_on_cli():
     )
 
 
+def _load_signing_key(path):
+    """Load a private key, prompting for its passphrase only if it needs one."""
+    try:
+        return load_private_key(path)
+    except TypeError:
+        pass                      # key is encrypted; a passphrase is required
+    except (OSError, ValueError) as e:
+        safe_print(f"❌ Cannot read signing key {path}: {e}")
+        sys.exit(1)
+
+    passphrase = _ask_password(f"Passphrase for {path}: ")
+    try:
+        return load_private_key(path, passphrase)
+    except (OSError, ValueError) as e:
+        safe_print(f"❌ Cannot unlock signing key {path}: {e}")
+        sys.exit(1)
+
+
+def cmd_keygen(args):
+    out = args.output
+    pub_path = out + '.pub'
+
+    for path in (out, pub_path):
+        if os.path.exists(path):
+            safe_print(f"❌ {path} already exists — refusing to overwrite a key")
+            sys.exit(1)
+
+    if args.no_passphrase:
+        passphrase = ''
+    else:
+        passphrase = _ask_password("Passphrase for the new key (blank = unencrypted): ")
+
+    private_pem, public_pem = generate_keypair(passphrase or None)
+
+    with open(out, 'wb') as f:
+        f.write(private_pem)
+    with open(pub_path, 'wb') as f:
+        f.write(public_pem)
+
+    try:
+        os.chmod(out, 0o600)
+    except OSError:
+        pass                      # best effort; Windows ignores POSIX modes
+
+    raw_pub = load_public_key(pub_path)
+    safe_print("✅ Signing key created")
+    safe_print(f"   Private key: {out}   (keep this secret)")
+    safe_print(f"   Public key:  {pub_path}   (share this)")
+    safe_print(f"   Fingerprint: {fingerprint(raw_pub)}")
+    if not passphrase:
+        safe_print("   ⚠️  Private key is NOT encrypted — protect the file itself")
+
+
+def cmd_verify(args):
+    try:
+        decoder = BioVaultDecoder(args.input)
+        expected = load_public_key(args.key)
+        decoder.require_signature(expected)
+        safe_print(f"\n✅ Signature valid — signed by {fingerprint(expected)}")
+        safe_print("   This vault has not been modified since it was signed.")
+    except VAULT_ERRORS as e:
+        safe_print(f"❌ Verification failed: {e}")
+        sys.exit(1)
+
+
 def cmd_encode(args):
     encoder = BioVaultEncoder()
     passwords = args.password or []
@@ -57,7 +144,7 @@ def cmd_encode(args):
 
     for i, item in enumerate(args.input):
         if ':' not in item:
-            safe_print(f"❌ Error: Use format 'filename:mode' (e.g. secret.pdf:A0)")
+            safe_print("❌ Error: Use format 'filename:mode' (e.g. secret.pdf:A0)")
             sys.exit(1)
         filepath, mode = item.rsplit(':', 1)
 
@@ -85,8 +172,10 @@ def cmd_encode(args):
             safe_print(f"❌ Error: {e}")
             sys.exit(1)
 
+    sign_key = _load_signing_key(args.sign) if args.sign else None
+
     try:
-        encoder.save(args.output)
+        encoder.save(args.output, sign_key=sign_key)
     except (ValueError, OSError) as e:
         safe_print(f"❌ Error: {e}")
         sys.exit(1)
@@ -94,7 +183,12 @@ def cmd_encode(args):
 
 def cmd_decode(args):
     try:
-        decoder = BioVaultDecoder(args.input)
+        decoder = BioVaultDecoder(args.input, max_decompressed=args.max_decompressed)
+
+        if args.verify:
+            decoder.require_signature(load_public_key(args.verify))
+            safe_print("   ✅ Signature verified")
+
         key = args.key.upper()
 
         password = args.password
@@ -119,7 +213,10 @@ def cmd_decode(args):
 
 def cmd_info(args):
     try:
-        decoder = BioVaultDecoder(args.input)
+        decoder = BioVaultDecoder(args.input, max_decompressed=args.max_decompressed)
+        if args.verify:
+            decoder.require_signature(load_public_key(args.verify))
+            safe_print("   ✅ Signature verified")
         decoder.info()
     except VAULT_ERRORS as e:
         safe_print(f"❌ Error: {e}")
@@ -129,7 +226,7 @@ def cmd_info(args):
 def main():
     parser = argparse.ArgumentParser(
         prog='biovault',
-        description='🧬 BioVault v3 — DNA-inspired multi-layer file format'
+        description='🧬 BioVault v4 — DNA-inspired multi-layer file format'
     )
     subparsers = parser.add_subparsers(dest='command')
 
@@ -145,6 +242,8 @@ def main():
     enc.add_argument('--password-stdin', action='store_true',
                      help='Read one password per input file from stdin, in order '
                           '(blank line = no encryption). Use this in scripts and CI')
+    enc.add_argument('--sign', metavar='KEYFILE', default=None,
+                     help='Sign the vault with an Ed25519 private key (see keygen)')
     enc.add_argument('--output', required=True,
                      help='Output vault file (e.g. vault.bvault)')
 
@@ -158,10 +257,30 @@ def main():
     dec.add_argument('--password-stdin', action='store_true',
                      help='Read the password from stdin instead of prompting. '
                           'Use this in scripts and CI')
+    dec.add_argument('--verify', metavar='PUBKEY', default=None,
+                     help='Require a valid signature from this public key')
+    dec.add_argument('--max-decompressed', type=_parse_size,
+                     default=DEFAULT_MAX_DECOMPRESSED, metavar='SIZE',
+                     help='Maximum bytes a single layer may decompress to (default 256M). Accepts K/M/G suffixes')
     dec.add_argument('--output', required=True, help='Output file path')
 
     inf = subparsers.add_parser('info', help='Show vault information')
     inf.add_argument('--input', required=True, help='Input .bvault file')
+    inf.add_argument('--verify', metavar='PUBKEY', default=None,
+                     help='Require a valid signature from this public key')
+    inf.add_argument('--max-decompressed', type=_parse_size,
+                     default=DEFAULT_MAX_DECOMPRESSED, metavar='SIZE',
+                     help='Maximum bytes a single layer may decompress to (default 256M). Accepts K/M/G suffixes')
+
+    key = subparsers.add_parser('keygen', help='Create an Ed25519 signing keypair')
+    key.add_argument('--output', required=True,
+                     help='Private key path; public key gets a .pub suffix')
+    key.add_argument('--no-passphrase', action='store_true',
+                     help='Skip the passphrase prompt (key stored unencrypted)')
+
+    ver = subparsers.add_parser('verify', help="Check a vault's signature")
+    ver.add_argument('--input', required=True, help='Input .bvault file')
+    ver.add_argument('--key', required=True, help='Public key file to check against')
 
     args = parser.parse_args()
 
@@ -171,6 +290,10 @@ def main():
         cmd_decode(args)
     elif args.command == 'info':
         cmd_info(args)
+    elif args.command == 'keygen':
+        cmd_keygen(args)
+    elif args.command == 'verify':
+        cmd_verify(args)
     else:
         parser.print_help()
 

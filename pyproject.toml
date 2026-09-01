@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "biovault"
-version = "3.0.0"
+version = "4.0.0"
 description = "DNA-inspired multi-layer file format"
 authors = [{name = "Harshal"}]
 license = {text = "MIT"}

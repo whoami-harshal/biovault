@@ -1,4 +1,4 @@
-# BioVault Format Specification v3.0
+# BioVault Format Specification v4.0
 
 **Author:** Harshal — 2026 — MIT License
 
@@ -19,12 +19,31 @@ per-layer password encryption.
 
 ```
 [MAGIC 4B "BVLT"] [VERSION 1B] [META_LENGTH 4B] [METADATA JSON]
-[LAYERS_BLOB] [CHECKSUM 64B] [FOOTER 4B "TLVB"]
+[LAYERS_BLOB] [CHECKSUM 64B] [SIG_FLAG 1B]
+[PUBKEY 32B + SIGNATURE 64B, only when SIG_FLAG = 1]
+[FOOTER 4B "TLVB"]
 ```
 
 Layer offsets in LAYERS_BLOB come from `packed_length` in metadata —
 no delimiter needed. CHECKSUM is a full SHA-256 hex digest of
 `METADATA || LAYERS_BLOB`.
+
+Base-4 symbols are packed **four per byte** (2 bits each), so the DNA
+representation is size-neutral. v3 and earlier packed only two per byte,
+doubling every vault.
+
+Because packing is the exact inverse of base-4 encoding, the whole symbol
+stage is expressible on bytes: mode A0 is the identity, a frame offset is a
+right shift of 2*frame bits, complementing is XOR 0x55, and reversing the
+strand is a byte reversal plus a 256-entry table. `transform.py` implements
+this; `frames.py` and `packer.py` remain the reference implementation, and the
+two are asserted equal in the test suite.
+
+When SIG_FLAG is 1, the Ed25519 signature covers every byte from MAGIC
+through CHECKSUM inclusive. The embedded public key is a convenience for
+displaying a fingerprint — it proves nothing on its own, since an attacker
+can re-sign modified content with their own key and swap it. Verification
+requires a public key supplied out of band.
 
 ## Layer Metadata
 
@@ -58,6 +77,8 @@ HMAC already authenticates those layers on decrypt.
   random salt per layer. Legacy `pbkdf2` vaults (PBKDF2-HMAC-SHA256,
   100,000 iterations) still decrypt.
 - Wrong password → no output, no partial write.
+- Ed25519 signing (optional) authenticates the whole container, including
+  unencrypted layers and all metadata.
 
 ## Threat Model
 
@@ -70,9 +91,10 @@ malformed metadata, decompression bombs, and attacker-chosen output paths.
 - **Hiding that data exists.** Layer count, reading keys, and per-layer
   `encrypted` flags are cleartext. This format offers no hidden volumes and
   no plausible deniability.
-- **Tamper-proofing unencrypted layers.** The trailing checksum is unkeyed;
-  anyone can modify a vault and recompute it. It catches corruption, not
-  attackers. Encrypted layers are protected by Fernet's HMAC.
+- **Tamper-proofing *unsigned* vaults.** Without a signature the trailing
+  checksum is unkeyed; anyone can modify a vault and recompute it. Sign
+  anything you distribute. Encrypted layer contents remain protected by
+  Fernet's HMAC either way.
 - **Traffic analysis.** Compress-then-encrypt means ciphertext length
   correlates with plaintext compressibility.
 
@@ -82,7 +104,7 @@ malformed metadata, decompression bombs, and attacker-chosen output paths.
 - Small files may end up larger post-encryption
 - No streaming — full file loaded into memory
 - Layers decompress to at most 256 MiB each by default (`max_decompressed`)
-- Not evaluated for post-quantum resistance
+- Ed25519 is not post-quantum resistant
 
 ## Reference Implementation
 
