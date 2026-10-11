@@ -1,4 +1,4 @@
-# BioVault Format Specification v4.0
+# BioVault Format Specification v5.0
 
 **Author:** Harshal — 2026 — MIT License
 
@@ -12,8 +12,11 @@ per-layer password encryption.
 
 - **Base-4 encoding:** A=00, T=01, G=10, C=11
 - **Reading frames:** A0/A1/A2 (forward), B0/B1/B2 (antisense)
-- **Pipeline:** compress (ZSTD) → encrypt (Fernet, optional) →
+- **Pipeline:** compress (ZSTD) → encrypt (AES-256-GCM, optional) →
   base-4 encode → frame offset → binary pack
+
+The base-4 and frame stages are a public, reversible addressing scheme. They
+provide no confidentiality; only the encryption stage does.
 
 ## File Structure
 
@@ -23,6 +26,9 @@ per-layer password encryption.
 [PUBKEY 32B + SIGNATURE 64B, only when SIG_FLAG = 1]
 [FOOTER 4B "TLVB"]
 ```
+
+VERSION is 5 for this specification. The metadata `version` field must equal
+the header byte. META_LENGTH is a big-endian uint32.
 
 Layer offsets in LAYERS_BLOB come from `packed_length` in metadata —
 no delimiter needed. CHECKSUM is a full SHA-256 hex digest of
@@ -53,9 +59,10 @@ requires a public key supplied out of band.
 | `sequence_length` | ATGC symbol count, for unpacking |
 | `payload_length` | Exact compressed(+encrypted) byte length |
 | `packed_length` | Bytes this layer occupies in the blob |
-| `encrypted` | Whether a password was used |
-| `salt` | Per-layer random salt (hex), or null |
-| `kdf` | `scrypt`, or `pbkdf2` for legacy vaults |
+| `encrypted` | Whether a password was used (boolean) |
+| `salt` | Per-layer random 16-byte salt (hex), or null |
+| `kdf` | `scrypt` for encrypted layers, else null |
+| `cipher` | `aes-256-gcm` for encrypted layers, else null |
 | `checksum` | SHA-256 of the plaintext — **null for encrypted layers** |
 | `original_size` | Plaintext length — **null for encrypted layers** |
 
@@ -65,25 +72,60 @@ where bytes land on disk.
 
 `checksum` and `original_size` are omitted for encrypted layers because
 metadata is readable without the password: a plaintext hash would let anyone
-confirm a guessed plaintext, and the exact size is itself a leak. Fernet's
-HMAC already authenticates those layers on decrypt.
+confirm a guessed plaintext, and the exact size is itself a leak. AES-GCM
+authenticates those layers on decrypt.
+
+## Encrypted Layers
+
+```
+key     = scrypt(password, salt, n=2^15, r=8, p=1, length=32)
+aad     = "BioVault/v{version}/layer/{mode}/{kdf}/{cipher}/" (ASCII) || salt
+payload = nonce (12 bytes) || AES-256-GCM(key, nonce, compressed, aad)
+```
+
+The GCM output is ciphertext followed by a 16-byte tag, so an encrypted layer
+is exactly 28 bytes larger than its compressed plaintext. Salt and nonce are
+fresh random bytes for every layer.
+
+Binding the version, reading mode, KDF, cipher and salt as associated data
+means an encrypted layer cannot be moved to a different reading key, or have
+its parameters edited, without failing authentication — even in an unsigned
+vault.
+
+The cipher and KDF are fixed by the format version, not chosen by metadata:
+
+| Version | Cipher | KDF |
+|---------|--------|-----|
+| 5 | `aes-256-gcm` | `scrypt` |
+| 4 | Fernet (no `cipher` field) | `scrypt`, or legacy `pbkdf2` |
+
+A decoder rejects any other combination, so a v5 vault cannot be downgraded
+by editing its metadata.
+
+### v4 compatibility
+
+v4 vaults are identical in structure but use version byte 4 and encrypt with
+Fernet (AES-128-CBC + HMAC-SHA256, key = base64url of the 32-byte KDF output,
+no associated data). v5 decoders read them; v5 encoders never write them.
+
+v5 replaced Fernet because a Fernet token carries a cleartext creation
+timestamp, is base64 text (about 40% larger than the ciphertext), begins with
+a constant prefix identifying the cipher, and uses AES-128.
 
 ## Security
 
-- Fernet: AES-128-CBC + HMAC-SHA256. Fernet splits the 32-byte key it is
-  given into a 16-byte signing key and a 16-byte AES key — hence AES-128,
-  not AES-256.
-- scrypt key derivation, n=2^15, r=8, p=1 (~32 MiB per guess), independent
-  random salt per layer. Legacy `pbkdf2` vaults (PBKDF2-HMAC-SHA256,
-  100,000 iterations) still decrypt.
-- Wrong password → no output, no partial write.
+- AES-256-GCM authenticated encryption, scrypt key derivation (~32 MiB per
+  guess), independent random salt and nonce per layer.
+- Layer metadata bound as associated data; cipher and KDF pinned by version.
+- Wrong password or modified layer → no output, no partial write.
 - Ed25519 signing (optional) authenticates the whole container, including
   unencrypted layers and all metadata.
 
 ## Threat Model
 
 **In scope.** Confidentiality and integrity of encrypted layer *contents*
-against someone holding the vault file. Safe handling of untrusted vaults:
+against someone holding the vault file, including relabelling an encrypted
+layer to a different reading key. Safe handling of untrusted vaults:
 malformed metadata, decompression bombs, and attacker-chosen output paths.
 
 **Out of scope.**
@@ -92,9 +134,10 @@ malformed metadata, decompression bombs, and attacker-chosen output paths.
   `encrypted` flags are cleartext. This format offers no hidden volumes and
   no plausible deniability.
 - **Tamper-proofing *unsigned* vaults.** Without a signature the trailing
-  checksum is unkeyed; anyone can modify a vault and recompute it. Sign
-  anything you distribute. Encrypted layer contents remain protected by
-  Fernet's HMAC either way.
+  checksum is unkeyed; anyone can modify unencrypted layers or metadata, or
+  replace an encrypted layer with one from another vault, and recompute it.
+  Sign anything you distribute. Encrypted layer contents remain protected by
+  GCM either way.
 - **Traffic analysis.** Compress-then-encrypt means ciphertext length
   correlates with plaintext compressibility.
 

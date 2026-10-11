@@ -18,6 +18,8 @@ from biovault.packer import pack_sequence, unpack_sequence
 from biovault.signing import generate_keypair, load_private_key, sign as ed_sign
 from biovault.frames import READING_MODES, get_antisense
 from biovault.transform import payload_to_packed, packed_to_payload
+from biovault.compression import compress_data
+from biovault.crypto import password_to_key, generate_salt, AES_GCM_OVERHEAD
 
 MAGIC = b'BVLT'
 FOOTER = b'TLVB'
@@ -50,8 +52,10 @@ def _read_vault(path):
     return meta, blob
 
 
-def _write_vault(path, meta, blob, version=4):
+def _write_vault(path, meta, blob, version=None):
     """Rebuild a vault the way an attacker would — recomputing the checksum."""
+    if version is None:
+        version = meta.get('version', 5)
     meta_bytes = json.dumps(meta).encode()
     with open(path, 'wb') as f:
         f.write(MAGIC)
@@ -358,7 +362,7 @@ def test_signature_detects_tampering():
 
     tampered = bytearray(blob)
     tampered[-2] ^= 0xFF
-    body = (MAGIC + bytes([4]) + struct.pack('>I', len(meta_bytes)) + meta_bytes
+    body = (MAGIC + bytes([raw[4]]) + struct.pack('>I', len(meta_bytes)) + meta_bytes
             + bytes(tampered) + _sha(meta_bytes + bytes(tampered)).encode())
     trailer = raw[start + len(blob) + 64:-4]        # keep the original signature
     open('signed.bvault', 'wb').write(body + bytes(trailer) + FOOTER)
@@ -413,6 +417,137 @@ def test_unsigned_vault_cannot_be_verified():
     _cleanup('plain.bvault', 'lone.pub')
 
 
+# ─────────────────────────────────────────
+# V5 ENCRYPTION (AES-256-GCM)
+# ─────────────────────────────────────────
+
+def _layer_payload(meta, blob, mode):
+    """Recover one layer's raw (compressed+encrypted) payload from a vault."""
+    offset = 0
+    for layer in meta['layers']:
+        if layer['mode'] == mode:
+            packed = blob[offset:offset + layer['packed_length']]
+            return packed_to_payload(packed, layer['sequence_length'], mode,
+                                     layer['payload_length'])
+        offset += layer['packed_length']
+    raise KeyError(mode)
+
+
+def _encrypted_vault(path, mode='A0', data=b'top secret layer', password='pw'):
+    encoder = BioVaultEncoder()
+    _quiet(encoder.add_layer, mode, 'secret.txt', data, password)
+    _quiet(encoder.save, path)
+    return _read_vault(path)
+
+
+def test_v5_layer_has_no_timestamp_or_base64_overhead():
+    """AES-GCM payload = nonce + ciphertext + tag: 28 bytes over compressed size, no Fernet token."""
+    data = b'quarterly numbers ' * 200
+    meta, blob = _encrypted_vault('gcm.bvault', data=data)
+    layer = meta['layers'][0]
+
+    assert meta['version'] == 5
+    assert layer['cipher'] == 'aes-256-gcm' and layer['kdf'] == 'scrypt'
+    assert layer['payload_length'] == len(compress_data(data)) + AES_GCM_OVERHEAD, \
+        "encrypted layer is larger than compressed size + nonce + tag"
+
+    payload = _layer_payload(meta, blob, 'A0')
+    assert not payload.startswith(b'gAAAAA'), "layer still looks like a Fernet token"
+
+    # Same data, same password -> different bytes (fresh salt and nonce).
+    meta2, blob2 = _encrypted_vault('gcm2.bvault', data=data)
+    assert _layer_payload(meta2, blob2, 'A0') != payload
+
+    print("✅ test_v5_layer_has_no_timestamp_or_base64_overhead passed")
+    _cleanup('gcm.bvault', 'gcm2.bvault')
+
+
+def test_encrypted_layer_cannot_be_relabelled():
+    """Moving an encrypted layer to another reading key must fail, even unsigned."""
+    secret = b'ops credentials: api_key=sk-live-1234'
+    meta, blob = _encrypted_vault('relabel.bvault', mode='B0', data=secret)
+    payload = _layer_payload(meta, blob, 'B0')
+
+    # Re-encode the identical ciphertext under A1, exactly as an attacker could.
+    packed, seq_len = payload_to_packed(payload, 'A1')
+    layer = meta['layers'][0]
+    layer.update(mode='A1', sequence_length=seq_len, packed_length=len(packed))
+    _write_vault('relabel.bvault', meta, packed)
+
+    decoder = _quiet(BioVaultDecoder, 'relabel.bvault')
+    out = _quiet(decoder.extract, 'A1', 'relabel_out.bin', password='pw')
+    assert out is None, "relabelled layer decrypted under a different reading key"
+    assert not os.path.exists('relabel_out.bin')
+
+    print("✅ test_encrypted_layer_cannot_be_relabelled passed")
+    _cleanup('relabel.bvault', 'relabel_out.bin')
+
+
+def test_cipher_and_kdf_downgrade_rejected():
+    """A v5 vault cannot be edited to claim Fernet or legacy PBKDF2."""
+    for field, value in (('cipher', 'fernet'), ('cipher', None), ('kdf', 'pbkdf2')):
+        meta, blob = _encrypted_vault('down.bvault')
+        meta['layers'][0][field] = value
+        _write_vault('down.bvault', meta, blob)
+        try:
+            _quiet(BioVaultDecoder, 'down.bvault')
+            raise AssertionError(f"{field}={value!r} accepted in a v5 vault")
+        except ValueError:
+            pass
+
+    print("✅ test_cipher_and_kdf_downgrade_rejected passed")
+    _cleanup('down.bvault')
+
+
+def test_metadata_version_must_match_header():
+    meta, blob = _encrypted_vault('mismatch.bvault')
+    meta['version'] = 4
+    _write_vault('mismatch.bvault', meta, blob, version=5)
+    try:
+        _quiet(BioVaultDecoder, 'mismatch.bvault')
+        raise AssertionError("header/metadata version mismatch accepted")
+    except ValueError:
+        pass
+
+    print("✅ test_metadata_version_must_match_header passed")
+    _cleanup('mismatch.bvault')
+
+
+def test_legacy_v4_vault_still_opens():
+    """Vaults written by v4 (Fernet layers) must still decrypt."""
+    from cryptography.fernet import Fernet
+
+    plain = b'public memo from v4'
+    secret = b'v4 secret encrypted with Fernet'
+
+    comp_plain = compress_data(plain)
+    packed_a0, seq_a0 = payload_to_packed(comp_plain, 'A0')
+
+    salt = generate_salt()
+    token = Fernet(password_to_key('pw', salt, 'scrypt')).encrypt(compress_data(secret))
+    packed_b0, seq_b0 = payload_to_packed(token, 'B0')
+
+    meta = {'version': 4, 'layer_count': 2, 'layers': [
+        {'mode': 'A0', 'sequence_length': seq_a0, 'payload_length': len(comp_plain),
+         'packed_length': len(packed_a0), 'encrypted': False, 'salt': None,
+         'kdf': None, 'checksum': _sha(plain), 'original_size': len(plain)},
+        {'mode': 'B0', 'sequence_length': seq_b0, 'payload_length': len(token),
+         'packed_length': len(packed_b0), 'encrypted': True, 'salt': salt.hex(),
+         'kdf': 'scrypt', 'checksum': None, 'original_size': None},
+    ]}
+    _write_vault('legacy.bvault', meta, packed_a0 + packed_b0, version=4)
+
+    decoder = _quiet(BioVaultDecoder, 'legacy.bvault')
+    assert decoder.version == 4
+    assert _quiet(decoder.extract, 'A0', 'legacy_a0.bin') == plain
+    assert _quiet(decoder.extract, 'B0', 'legacy_b0.bin', password='pw') == secret
+    assert _quiet(decoder.extract, 'B0', 'legacy_bad.bin', password='nope') is None
+    assert not os.path.exists('legacy_bad.bin')
+
+    print("✅ test_legacy_v4_vault_still_opens passed")
+    _cleanup('legacy.bvault', 'legacy_a0.bin', 'legacy_b0.bin', 'legacy_bad.bin')
+
+
 if __name__ == '__main__':
     print("\n🧪 Running BioVault Tests...\n")
     test_base4_roundtrip()
@@ -435,5 +570,12 @@ if __name__ == '__main__':
     test_signature_detects_tampering()
     test_signature_wrong_key_rejected()
     test_unsigned_vault_cannot_be_verified()
+
+    print("\n🔐 v5 encryption...\n")
+    test_v5_layer_has_no_timestamp_or_base64_overhead()
+    test_encrypted_layer_cannot_be_relabelled()
+    test_cipher_and_kdf_downgrade_rejected()
+    test_metadata_version_must_match_header()
+    test_legacy_v4_vault_still_opens()
 
     print("\n🎉 All tests passed!")

@@ -1,6 +1,8 @@
 # biovault/decoder.py
-# V4 — Full pipeline: unpack -> remove frame offset -> base4_to_bytes ->
+# V5 — Full pipeline: unpack -> remove frame offset -> base4_to_bytes ->
 #       trim to payload_length -> decrypt(if needed) -> decompress
+#
+# Reads v5 vaults (AES-256-GCM layers) and v4 vaults (Fernet layers).
 #
 # Everything in a vault's metadata is attacker-controlled: the trailing
 # checksum is unkeyed, so anyone can edit a vault and recompute it. This
@@ -12,7 +14,7 @@ import struct
 import hashlib
 from .frames import READING_MODES
 from .transform import packed_to_payload
-from .crypto import decrypt_data, DEFAULT_KDF
+from .crypto import decrypt_data, layer_aad, CIPHER_AES_GCM, CIPHER_FERNET
 from .compression import decompress_data, DEFAULT_MAX_DECOMPRESSED
 from .signing import verify, fingerprint, SIGNATURE_LEN, PUBLIC_KEY_LEN
 from .output import safe_print
@@ -20,7 +22,16 @@ from .output import safe_print
 MAGIC = b'BVLT'
 FOOTER_MAGIC = b'TLVB'
 CHECKSUM_HEX_LEN = 64
-SUPPORTED_VERSION = 4
+SUPPORTED_VERSION = 5          # what this decoder writes and prefers
+OLDEST_SUPPORTED_VERSION = 4
+
+# Which cipher and KDFs an encrypted layer may use, fixed by format version.
+# Metadata cannot choose a different combination, so a v5 vault cannot be
+# downgraded to Fernet or to the weaker legacy PBKDF2 by editing it.
+ALLOWED_CRYPTO = {
+    4: (CIPHER_FERNET, ('scrypt', 'pbkdf2')),
+    5: (CIPHER_AES_GCM, ('scrypt',)),
+}
 
 
 def compute_checksum(data: bytes) -> str:
@@ -48,6 +59,7 @@ class BioVaultDecoder:
         self.max_decompressed = max_decompressed
         self.metadata = None
         self.layers_blob = None
+        self.version = None
         self.signed = False
         self.signature = None
         self.public_key = None
@@ -61,10 +73,10 @@ class BioVaultDecoder:
                 raise ValueError("Not a valid BioVault file")
 
             version = _read_exact(f, 1, 'version byte')[0]
-            if version < SUPPORTED_VERSION:
+            if version < OLDEST_SUPPORTED_VERSION:
                 raise ValueError(
-                    f"This is a v{version}.x file. This decoder is v{SUPPORTED_VERSION}-only. "
-                    f"Re-encode it with the v{SUPPORTED_VERSION} encoder to use this tool."
+                    f"This is a v{version}.x file. This decoder reads "
+                    f"v{OLDEST_SUPPORTED_VERSION} and v{SUPPORTED_VERSION} vaults only."
                 )
             if version > SUPPORTED_VERSION:
                 raise ValueError(
@@ -80,6 +92,7 @@ class BioVaultDecoder:
             except (UnicodeDecodeError, json.JSONDecodeError) as e:
                 raise ValueError(f"BioVault metadata is unreadable — {e}")
 
+            self.version = version
             self._validate_metadata()
 
             blob_length = sum(l['packed_length'] for l in self.metadata['layers'])
@@ -128,6 +141,13 @@ class BioVaultDecoder:
         if not isinstance(meta, dict):
             raise ValueError("BioVault metadata is not an object")
 
+        if meta.get('version') != self.version:
+            raise ValueError(
+                f"BioVault metadata version {meta.get('version')!r} does not match "
+                f"the file header (v{self.version})"
+            )
+        allowed_cipher, allowed_kdfs = ALLOWED_CRYPTO[self.version]
+
         layers = meta.get('layers')
         if not isinstance(layers, list) or not layers:
             raise ValueError("BioVault metadata contains no layers")
@@ -152,7 +172,24 @@ class BioVaultDecoder:
             for field in ('sequence_length', 'payload_length', 'packed_length'):
                 _require_size(layer, field, mode)
 
+            if not isinstance(layer.get('encrypted', False), bool):
+                raise ValueError(f"BioVault metadata: layer {mode} has invalid 'encrypted'")
+
             if layer.get('encrypted'):
+                # v4 layers carry no 'cipher' field; their cipher is implied.
+                cipher = layer.get('cipher', CIPHER_FERNET if self.version == 4 else None)
+                if cipher != allowed_cipher:
+                    raise ValueError(
+                        f"BioVault metadata: layer {mode} uses cipher {cipher!r}, "
+                        f"but v{self.version} vaults require {allowed_cipher!r}"
+                    )
+                if layer.get('kdf') not in allowed_kdfs:
+                    raise ValueError(
+                        f"BioVault metadata: layer {mode} uses KDF {layer.get('kdf')!r}, "
+                        f"not allowed in v{self.version} vaults"
+                    )
+                layer['cipher'] = cipher
+
                 salt = layer.get('salt')
                 if not isinstance(salt, str):
                     raise ValueError(
@@ -247,10 +284,15 @@ class BioVaultDecoder:
                 safe_print(f"  ❌ Layer {mode} is encrypted — password required")
                 return None
             salt = bytes.fromhex(layer_meta['salt'])
-            kdf = layer_meta.get('kdf') or DEFAULT_KDF
-            decrypted = decrypt_data(payload, password, salt, kdf)
+            kdf = layer_meta['kdf']
+            cipher = layer_meta['cipher']
+            aad = (
+                layer_aad(self.version, mode, kdf, cipher, salt)
+                if cipher == CIPHER_AES_GCM else b''
+            )
+            decrypted = decrypt_data(payload, password, salt, kdf, cipher, aad)
             if decrypted is None:
-                safe_print(f"  ⚠️  Wrong password — nothing recovered")
+                safe_print(f"  ⚠️  Wrong password or modified layer — nothing recovered")
                 return None
             payload = decrypted
 
@@ -282,8 +324,9 @@ class BioVaultDecoder:
                 )
             safe_print(f"  ✅ Checksum verified")
         elif layer_meta.get('encrypted'):
-            # Fernet already authenticated this layer during decrypt.
-            safe_print(f"  ✅ Authenticated on decrypt (HMAC-SHA256)")
+            # The cipher already authenticated this layer during decrypt.
+            how = 'AES-256-GCM' if layer_meta['cipher'] == CIPHER_AES_GCM else 'Fernet, HMAC-SHA256'
+            safe_print(f"  ✅ Authenticated on decrypt ({how})")
 
         # The output path is never taken from vault metadata — a crafted vault
         # would otherwise choose where these bytes land on disk.

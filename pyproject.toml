@@ -4,15 +4,47 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "biovault"
-version = "4.0.0"
-description = "DNA-inspired multi-layer file format"
+version = "5.0.0"
+description = "DNA-inspired multi-layer file format: one signed file, up to six independently encrypted layers"
+readme = "README.md"
 authors = [{name = "Harshal"}]
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "cryptography>=41.0.0",
     "zstandard>=0.21.0",
 ]
+keywords = ["encryption", "file-format", "aes-gcm", "ed25519", "signing", "ctf", "dna"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security :: Cryptography",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/whoami-harshal/biovault"
+Specification = "https://github.com/whoami-harshal/biovault/blob/main/SPEC.md"
+Changelog = "https://github.com/whoami-harshal/biovault/blob/main/CHANGELOG.md"
+Issues = "https://github.com/whoami-harshal/biovault/issues"
 
 [project.scripts]
 biovault = "biovault.cli:main"
+
+[tool.setuptools]
+packages = ["biovault"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

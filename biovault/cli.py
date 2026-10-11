@@ -1,5 +1,5 @@
 # biovault/cli.py
-# V4 — encode/decode/info, plus keygen and signature verification
+# V5 — encode/decode/info, plus keygen and signature verification
 
 import argparse
 import getpass
@@ -226,7 +226,7 @@ def cmd_info(args):
 def main():
     parser = argparse.ArgumentParser(
         prog='biovault',
-        description='🧬 BioVault v4 — DNA-inspired multi-layer file format'
+        description='🧬 BioVault v5 — DNA-inspired multi-layer file format'
     )
     subparsers = parser.add_subparsers(dest='command')
 
