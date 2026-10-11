@@ -1,5 +1,5 @@
 # examples/demo.py
-# BioVault v4 demo — one vault, three files, three keys, one signature.
+# BioVault v5 demo — one vault, three files, three keys, one signature.
 #
 # Passwords are hardcoded here so the demo runs unattended. Real usage should
 # use `biovault encode --prompt-password` so nothing lands in your shell history.
@@ -35,7 +35,7 @@ def header(title):
     safe_print(f"\n{LINE}\n{title}\n{LINE}")
 
 
-header("🧬 BioVault v4 Demo")
+header("🧬 BioVault v5 Demo")
 
 # ── Create the source files ──
 safe_print("\n📝 Creating three files with different sensitivities...\n")

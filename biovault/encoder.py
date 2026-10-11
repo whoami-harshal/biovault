@@ -1,5 +1,5 @@
 # biovault/encoder.py
-# V4 — Full pipeline: compress -> encrypt(optional) -> base4 -> pack
+# V5 — Full pipeline: compress -> encrypt(optional, AES-256-GCM) -> base4 -> pack
 
 import os
 import json
@@ -7,13 +7,15 @@ import struct
 import hashlib
 from .frames import READING_MODES
 from .transform import payload_to_packed
-from .crypto import encrypt_data
+from .crypto import (
+    encrypt_data, generate_salt, layer_aad, DEFAULT_KDF, DEFAULT_CIPHER,
+)
 from .compression import compress_data
 from .signing import sign, SIGNATURE_LEN, PUBLIC_KEY_LEN, fingerprint
 from .output import safe_print
 
 MAGIC = b'BVLT'
-VERSION = 4
+VERSION = 5
 FOOTER_MAGIC = b'TLVB'
 
 # Full SHA-256, not truncated. The old 64-bit prefix was birthday-weak, and
@@ -31,23 +33,26 @@ def encode_layer(data: bytes, mode: str, password: str = None):
     Full pipeline for one layer.
     data -> compress -> encrypt(if password) -> base4 -> frame offset -> pack
 
-    Returns: (packed_bytes, sequence_length, payload_length, encrypted, salt, kdf)
+    Returns: (packed_bytes, sequence_length, payload_length, encrypted, salt, kdf, cipher)
     """
     compressed = compress_data(data)
 
     salt = None
     kdf = None
+    cipher = None
     encrypted = False
     payload = compressed
 
     if password:
-        payload, salt, kdf = encrypt_data(compressed, password)
+        kdf, cipher, salt = DEFAULT_KDF, DEFAULT_CIPHER, generate_salt()
+        aad = layer_aad(VERSION, mode, kdf, cipher, salt)
+        payload, salt, kdf = encrypt_data(compressed, password, aad=aad, salt=salt)
         encrypted = True
 
     payload_length = len(payload)  # exact byte length — needed to trim padding later
 
     packed, sequence_length = payload_to_packed(payload, mode)
-    return packed, sequence_length, payload_length, encrypted, salt, kdf
+    return packed, sequence_length, payload_length, encrypted, salt, kdf, cipher
 
 
 class BioVaultEncoder:
@@ -79,7 +84,9 @@ class BioVaultEncoder:
 
         for mode, filename, data, password in self.layers:
             safe_print(f"  🔄 Encoding layer {mode}...")
-            packed, seq_len, payload_len, encrypted, salt, kdf = encode_layer(data, mode, password)
+            packed, seq_len, payload_len, encrypted, salt, kdf, cipher = encode_layer(
+                data, mode, password
+            )
 
             layer_meta = {
                 'mode': mode,
@@ -89,14 +96,15 @@ class BioVaultEncoder:
                 'encrypted': encrypted,
                 'salt': salt.hex() if salt else None,
                 'kdf': kdf,
+                'cipher': cipher,
             }
 
             if encrypted:
                 # Deliberately absent for encrypted layers: metadata is
                 # readable without the password, so a plaintext hash would let
                 # anyone confirm a guessed plaintext, and the exact plaintext
-                # size is itself a leak. Fernet's HMAC already authenticates
-                # the layer when it is decrypted.
+                # size is itself a leak. AES-GCM already authenticates the
+                # layer when it is decrypted.
                 layer_meta['checksum'] = None
                 layer_meta['original_size'] = None
             else:

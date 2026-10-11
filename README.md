@@ -2,14 +2,16 @@
 
 # 🧬 BioVault
 
-**One file. Six keys. Six different answers.**
+**One file. Six layers. Six passwords.**
 
 A DNA-inspired multi-layer file format — the same vault yields completely
 different content depending on which reading key you open it with.
 
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![CI](https://github.com/whoami-harshal/biovault/actions/workflows/ci.yml/badge.svg)](https://github.com/whoami-harshal/biovault/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Format](https://img.shields.io/badge/format-v4.0.0-purple.svg)](SPEC.md)
+[![Format](https://img.shields.io/badge/format-v5.0.0-purple.svg)](SPEC.md)
+[![Encryption](https://img.shields.io/badge/encryption-AES--256--GCM-0B6E5F.svg)](#security)
 [![Signed](https://img.shields.io/badge/signing-Ed25519-0B6E5F.svg)](#authenticity)
 [![Status](https://img.shields.io/badge/status-experimental-orange.svg)](#status)
 
@@ -25,6 +27,10 @@ reading and which direction you read it. BioVault does that with files.
 Pack up to six files into one vault. Each is addressed by a **reading key** —
 three forward frames (`A0`, `A1`, `A2`) and three antisense frames (`B0`, `B1`,
 `B2`) — and each carries its own independent password.
+
+> The DNA encoding is a reversible addressing scheme, not encryption. Every
+> layer's confidentiality comes from standard AES-256-GCM with a scrypt-derived
+> key; the reading frames decide *where* a layer lives, not *who* can read it.
 
 ```
                     ┌─────────────────┐
@@ -43,7 +49,7 @@ cd biovault
 pip install -e .
 ```
 
-Python 3.9+. Dependencies: `cryptography`, `zstandard`.
+Python 3.10+. Dependencies: `cryptography`, `zstandard`.
 
 ## See it work
 
@@ -69,7 +75,7 @@ biovault encode --input "board.txt:A0" "memo.txt:A1" "creds.env:B0" --prompt-pas
   Layer A1 queued: memo.txt (25 bytes) [plain]
   Layer B0 queued: creds.env (24 bytes) [🔐 encrypted]
 
-🧬 Building BioVault v4: company.bvault
+🧬 Building BioVault v5: company.bvault
 ✅ BioVault created: company.bvault
    Keys: ['A0', 'A1', 'B0']
 ```
@@ -82,7 +88,7 @@ biovault decode --input company.bvault --key A0 --output board.txt
 
 ```
 🔓 Extracting layer A0...
-  ✅ Authenticated on decrypt (HMAC-SHA256)
+  ✅ Authenticated on decrypt (AES-256-GCM)
 
 Q4 revenue: 2.4M
 Runway: 18 months
@@ -155,7 +161,7 @@ biovault decode --input company.bvault --key B0 --password "boardpass" --output 
 ```
 
 ```
-  ⚠️  Wrong password — nothing recovered
+  ⚠️  Wrong password or modified layer — nothing recovered
 ```
 
 `boardpass` is the *correct* password — for layer `A0`. Against `B0` it is
@@ -190,7 +196,7 @@ Each layer runs an independent pipeline:
 ```mermaid
 flowchart LR
     A[File bytes] --> B[ZSTD<br/>compress]
-    B --> C[Encrypt<br/>Fernet]
+    B --> C[Encrypt<br/>AES-256-GCM]
     C --> D[Base-4<br/>ATGC]
     D --> E[Frame<br/>offset]
     E --> F[Bit-pack]
@@ -198,7 +204,7 @@ flowchart LR
 ```
 
 1. **Compress** — ZSTD level 9
-2. **Encrypt** — Fernet (AES-128-CBC + HMAC-SHA256), scrypt-derived key, random salt per layer
+2. **Encrypt** — AES-256-GCM, scrypt-derived key, random salt and nonce per layer; adds exactly 28 bytes
 3. **Base-4 encode** — every 2 bits becomes a nucleotide: `A=00 T=01 G=10 C=11`
 4. **Frame offset** — the reading key sets the strand and offset
 5. **Bit-pack** — four symbols per byte, so the DNA representation costs nothing
@@ -209,7 +215,10 @@ Decoding runs it backwards. Full details in [SPEC.md](SPEC.md).
 
 **What holds:**
 
-- Encrypted layers use **authenticated** encryption — a tampered layer fails to decrypt rather than returning corrupted bytes
+- Encrypted layers use **AES-256-GCM**, authenticated encryption — a tampered layer fails to decrypt rather than returning corrupted bytes
+- Each encrypted layer is **bound to its own metadata** (version, reading key, KDF, cipher, salt) — move it to a different key and it fails to decrypt, even in an unsigned vault
+- The cipher and KDF are **fixed by the format version**, so a vault cannot be edited to downgrade them
+- Encrypted layers carry **no timestamp and no cipher fingerprint**: nonce, ciphertext and tag are indistinguishable from random bytes
 - **scrypt** key derivation (n=2¹⁵, ~32 MiB per guess) resists GPU and ASIC cracking
 - Independent random salt per layer, so the same password on two layers still produces different keys
 - **Ed25519 signatures** authenticate the entire container, including unencrypted layers and all metadata
@@ -279,7 +288,7 @@ and layered password releases make multi-stage challenges straightforward.
 **Compartmentalized field notes.** Research or reporting material where a
 compromised password exposes one compartment instead of the whole archive.
 
-**A teaching artifact.** The v2→v4 history is a complete worked example of
+**A teaching artifact.** The v2→v5 history is a complete worked example of
 finding and fixing real vulnerabilities — path traversal, decompression bombs,
 plaintext-confirmation — with working exploits and regression tests for each.
 
@@ -291,7 +300,7 @@ fixed, each with a working proof-of-concept and a regression test:
 | Severity | Issue | Fix |
 |----------|-------|-----|
 | **Critical** | Arbitrary file write — vault metadata chose the output path, so a crafted vault could write to `~/.ssh/authorized_keys` | Output paths are generated locally, never read from the file |
-| **Critical** | Encrypted layers stored a SHA-256 of their **plaintext** in cleartext metadata, letting anyone confirm a guessed plaintext without the password | Removed for encrypted layers; Fernet's HMAC already authenticates them |
+| **Critical** | Encrypted layers stored a SHA-256 of their **plaintext** in cleartext metadata, letting anyone confirm a guessed plaintext without the password | Removed for encrypted layers; authenticated encryption already covers them |
 | **High** | Integrity failures printed a warning, then wrote the file anyway | Raises and writes nothing |
 | **High** | Decompression bombs — 1.6 KB expanded to 50 MB unchecked | Streaming decompression with a hard output cap |
 | **Medium** | PBKDF2 at 100k iterations, below the OWASP floor | Switched to scrypt (memory-hard) |
@@ -300,25 +309,39 @@ v4 closed the last finding — an unkeyed container checksum — with Ed25519
 signing, and fixed a packing bug that made every vault exactly twice the size
 it needed to be.
 
+v5 replaced Fernet after a second look at what its token format leaks:
+
+| Severity | Issue | Fix |
+|----------|-------|-----|
+| **Medium** | Every Fernet token stores a **cleartext timestamp**, so anyone holding a vault could read when each encrypted layer was created, to the second | AES-256-GCM: nonce, ciphertext and tag only |
+| **Medium** | Encrypted layers could be **relabelled** to a different reading key in an unsigned vault | Layer metadata bound as GCM associated data |
+| **Low** | Fernet's base64 output inflated encrypted layers by ~40%, and its constant `gAAAAA` prefix identified the cipher | Raw binary payload, fixed 28-byte overhead |
+
 Plus: 64-bit truncated checksums replaced with full SHA-256, metadata
 validation on untrusted input, secure password entry, and corrected docs — v2
 advertised "AES-256" when Fernet is AES-128, and claimed a plausible
-deniability the format never provided.
+deniability the format never provided. v5 is now genuinely AES-256.
 
 ```bash
-python tests/test_core.py
+pip install -e ".[test]"
+python -m pytest
 ```
 
-Fifteen tests, nine of which replay the original exploits or verify signing.
+Twenty-one tests, fourteen of which replay the original exploits, verify
+signing, or pin the v5 encryption guarantees. `python tests/test_core.py`
+still works without pytest.
 
 ## Roadmap
 
 - [x] ~~Halve vault size~~ — packer now stores 4 symbols per byte (v4)
 - [x] ~~Authenticate the whole container~~ — Ed25519 signing (v4)
 - [x] ~~Make the pipeline fast enough for real artifacts~~ — byte-level transform, ~140x faster (v4)
+- [x] ~~Drop Fernet~~ — AES-256-GCM with metadata binding (v5)
+- [x] ~~CI and pytest runner~~ — Linux, Windows and macOS (v5)
 - [ ] **Streaming pipeline** — speed is solved, but memory is still proportional to file size
+- [ ] **Size padding** — optional bucketed layer sizes to blunt the length leak
 - [ ] **Deniable mode** — fixed-size, random-filled containers where layer count is genuinely unknowable
-- [ ] CI, pytest runner, type hints
+- [ ] Type hints throughout
 
 ## Status
 

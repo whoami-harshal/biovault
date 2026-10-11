@@ -17,7 +17,7 @@ from .signing import (
     generate_keypair, load_private_key, load_public_key, sign, verify, fingerprint
 )
 
-__version__ = '4.0.0'
+__version__ = '5.0.0'
 __author__ = 'Harshal'
 __description__ = 'DNA-inspired multi-layer file format'
 
